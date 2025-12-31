@@ -36,4 +36,24 @@ This fork is being extended in the following steps:
 > Note: This roadmap describes the planned direction. Individual items may be developed behind feature flags and merged incrementally.
 
 ---
+## Build (CMake + CUDA LibTorch)
+
+### Prerequisites
+- CUDA-capable NVIDIA GPU and a working NVIDIA driver
+- CUDA Toolkit installed (must provide `include/cuda_runtime.h` and `lib*/libcudart.so`)
+- CUDA-enabled LibTorch distribution (not CPU-only)
+- CMake 3.20+ and a C++17-capable compiler
+
+### Configure
+Replace the placeholders with paths on your system:
+
+- `Torch_DIR` must point to: `<LIBTORCH_ROOT>/share/cmake/Torch`
+- `CUDAToolkit_ROOT` / `CUDA_TOOLKIT_ROOT_DIR` must point to your CUDA Toolkit root
+
+```bash
+cmake -S . -B build \
+  -DTorch_DIR=<LIBTORCH_ROOT>/share/cmake/Torch \
+  -DCUDAToolkit_ROOT=<CUDA_TOOLKIT_ROOT> \
+  -DCUDA_TOOLKIT_ROOT_DIR=<CUDA_TOOLKIT_ROOT> \
+  -DCMAKE_BUILD_TYPE=Release
 
