@@ -1,0 +1,19 @@
+# build outputs
+build/
+**/build/
+
+# CMake generated
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+CTestTestfile.cmake
+_testing/
+_deps/
+
+# binaries and libs
+*.o
+*.a
+*.so
+
+
