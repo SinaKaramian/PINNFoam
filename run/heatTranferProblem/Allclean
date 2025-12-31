@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+
+cd "$(dirname "$0")"
+
+echo "Cleaning: $(pwd)"
+
+rm -rf 1
+
+rm -f log.blockMesh log.laplacianMatrixFoam
+
+rm -f case.foam
+
+rm -rf constant/polyMesh
+
+echo "Done."

@@ -1,0 +1,46 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    location    "system";
+    object      fvSolution;
+}
+
+solvers
+{
+    T
+    {
+        solver          PCG;
+        preconditioner  DIC;
+        tolerance       1e-12;
+        relTol          0;
+    }
+}
+
+relaxationFactors
+{
+    equations
+    {
+        T               1.0;
+    }
+}
+
+AI
+{
+    maxIterations  20000;
+    hiddenLayers   (30 30 30 30 30);
+    optimizerStep  1e-04;
+
+    lambdaData     1.0;
+    lambdaPDE      0.0;
+    lambdaBC       1.0;
+
+    warmupEpochs   5000;
+    pdeRampEpochs  5000;
+
+    trainFraction  1.0;
+    pdeFraction    0.0;
+    seed           0;
+}
+
