@@ -44,7 +44,10 @@ This fork is being extended in the following steps:
 - CUDA-enabled LibTorch distribution (not CPU-only)
 - CMake 3.20+ and a C++17-capable compiler
 
-### Configure
+### 1) Make CUDA available in your terminal session
+
+### 2) Configure (use `g++`)
+
 Replace the placeholders with paths on your system:
 
 - `Torch_DIR` must point to: `<LIBTORCH_ROOT>/share/cmake/Torch`
@@ -52,8 +55,21 @@ Replace the placeholders with paths on your system:
 
 ```bash
 cmake -S . -B build \
+  -DCMAKE_CXX_COMPILER=g++ \
   -DTorch_DIR=<LIBTORCH_ROOT>/share/cmake/Torch \
   -DCUDAToolkit_ROOT=<CUDA_TOOLKIT_ROOT> \
   -DCUDA_TOOLKIT_ROOT_DIR=<CUDA_TOOLKIT_ROOT> \
   -DCMAKE_BUILD_TYPE=Release
+```
 
+### 3) Build
+
+```bash
+cmake --build build -j
+```
+
+### 4) Run all tests (pass/fail)
+
+```bash
+ctest --test-dir build --output-on-failure
+```
