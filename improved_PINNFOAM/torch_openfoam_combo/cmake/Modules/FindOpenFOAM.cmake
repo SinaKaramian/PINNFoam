@@ -1,10 +1,29 @@
+# cmake/Modules/FindOpenFOAM.cmake
+#
+# Usage (MODULE mode):
+#   list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/Modules")
+#   find_package(OpenFOAM REQUIRED)
+#
+# Targets provided:
+#   OpenFOAM::compileOptions  (ALIAS of OpenFOAM_compileOptions)
+#   OpenFOAM::OpenFOAM        (IMPORTED)
+#   OpenFOAM::meshTools       (IMPORTED)
+#   OpenFOAM::finiteVolume    (IMPORTED)
+#   OpenFOAM::Pstream         (IMPORTED, optional if found)
+
 include(FindPackageHandleStandardArgs)
 
+# -------------------------------------------------------------------------
+# User hints (optional). No hardcoded paths.
+# -------------------------------------------------------------------------
 set(OpenFOAM_ROOT        "" CACHE PATH "OpenFOAM project dir (WM_PROJECT_DIR)")
 set(OpenFOAM_SRC         "" CACHE PATH "OpenFOAM src dir (FOAM_SRC)")
 set(OpenFOAM_LIBDIR      "" CACHE PATH "OpenFOAM lib dir (FOAM_LIBBIN)")
 set(OpenFOAM_USER_LIBDIR "" CACHE PATH "OpenFOAM user lib dir (FOAM_USER_LIBBIN)")
 
+# -------------------------------------------------------------------------
+# Discover root/src/libdir from environment (preferred) or cache hints
+# -------------------------------------------------------------------------
 set(_of_root "")
 if(OpenFOAM_ROOT)
   set(_of_root "${OpenFOAM_ROOT}")
@@ -37,12 +56,16 @@ elseif(DEFINED ENV{FOAM_USER_LIBBIN})
   set(_of_user_libdir "$ENV{FOAM_USER_LIBBIN}")
 endif()
 
+# -------------------------------------------------------------------------
+# Validate headers (fvCFD.H is a strong signal for finiteVolume)
+# -------------------------------------------------------------------------
 find_path(OpenFOAM_FV_INCLUDE_DIR
   NAMES fvCFD.H
   HINTS "${_of_src}/finiteVolume/lnInclude"
   NO_DEFAULT_PATH
 )
 
+# Include dirs used by many solvers
 set(OpenFOAM_INCLUDE_DIRS
   "${_of_src}/finiteVolume/lnInclude"
   "${_of_src}/meshTools/lnInclude"
@@ -50,6 +73,9 @@ set(OpenFOAM_INCLUDE_DIRS
   "${_of_src}/OSspecific/POSIX/lnInclude"
 )
 
+# -------------------------------------------------------------------------
+# Libraries (search FOAM_LIBBIN first, then FOAM_USER_LIBBIN)
+# -------------------------------------------------------------------------
 set(_of_lib_hints "")
 if(_of_libdir)
   list(APPEND _of_lib_hints "${_of_libdir}")
@@ -76,8 +102,28 @@ find_library(OpenFOAM_finiteVolume_LIBRARY
   NO_DEFAULT_PATH
 )
 
+# ---- Pstream (MPI/parallel comms; fixes UPstream/gMax/gSum link errors) ----
+set(_of_pstream_hints ${_of_lib_hints})
+if(_of_libdir)
+  list(APPEND _of_pstream_hints
+    "${_of_libdir}/sys-openmpi"
+    "${_of_libdir}/sys-mpich"
+    "${_of_libdir}/sys-mpi"
+  )
+endif()
+
+find_library(OpenFOAM_Pstream_LIBRARY
+  NAMES Pstream
+  HINTS ${_of_pstream_hints}
+  NO_DEFAULT_PATH
+)
+
+# -------------------------------------------------------------------------
+# Definitions: derived from OpenFOAM environment when available (no hardcoding)
+# -------------------------------------------------------------------------
 set(OpenFOAM_DEFINITIONS "")
 
+# OPENFOAM=#### derived from WM_PROJECT_VERSION if it contains digits
 if(DEFINED ENV{WM_PROJECT_VERSION})
   string(REGEX MATCH "([0-9]+)" _of_ver_match "$ENV{WM_PROJECT_VERSION}")
   if(_of_ver_match)
@@ -85,6 +131,7 @@ if(DEFINED ENV{WM_PROJECT_VERSION})
   endif()
 endif()
 
+# Precision macro
 if(DEFINED ENV{WM_PRECISION_OPTION})
   if("$ENV{WM_PRECISION_OPTION}" STREQUAL "DP")
     list(APPEND OpenFOAM_DEFINITIONS "WM_DP")
@@ -93,15 +140,21 @@ if(DEFINED ENV{WM_PRECISION_OPTION})
   endif()
 endif()
 
+# Label size macro
 if(DEFINED ENV{WM_LABEL_SIZE})
   list(APPEND OpenFOAM_DEFINITIONS "WM_LABEL_SIZE=$ENV{WM_LABEL_SIZE}")
 endif()
 
+# NoRepository: enable only if you choose to (default ON, but user-controllable)
 set(OpenFOAM_USE_NOREPOSITORY ON CACHE BOOL "Define NoRepository (matches common wmake user-app behavior)")
 if(OpenFOAM_USE_NOREPOSITORY)
   list(APPEND OpenFOAM_DEFINITIONS "NoRepository")
 endif()
 
+# -------------------------------------------------------------------------
+# Compile/link flags: take them from the OpenFOAM environment if present
+# (no hardcoded warning/optimization flags here).
+# -------------------------------------------------------------------------
 set(OpenFOAM_COMPILE_OPTIONS "")
 if(DEFINED ENV{WM_CXXFLAGS} AND NOT "$ENV{WM_CXXFLAGS}" STREQUAL "")
   set(_of_cxxflags "$ENV{WM_CXXFLAGS}")
@@ -116,6 +169,9 @@ if(DEFINED ENV{WM_LDFLAGS} AND NOT "$ENV{WM_LDFLAGS}" STREQUAL "")
   list(APPEND OpenFOAM_LINK_OPTIONS ${_of_ldflags})
 endif()
 
+# -------------------------------------------------------------------------
+# Standard handling
+# -------------------------------------------------------------------------
 find_package_handle_standard_args(OpenFOAM
   REQUIRED_VARS
     _of_root
@@ -127,6 +183,7 @@ find_package_handle_standard_args(OpenFOAM
     OpenFOAM_finiteVolume_LIBRARY
 )
 
+# Legacy variables (optional)
 set(OpenFOAM_LIBRARY_DIR "${_of_libdir}")
 set(OpenFOAM_LIBRARIES
   "${OpenFOAM_finiteVolume_LIBRARY}"
@@ -134,8 +191,16 @@ set(OpenFOAM_LIBRARIES
   "${OpenFOAM_OpenFOAM_LIBRARY}"
 )
 
+if(OpenFOAM_Pstream_LIBRARY)
+  list(APPEND OpenFOAM_LIBRARIES "${OpenFOAM_Pstream_LIBRARY}")
+endif()
+
+# -------------------------------------------------------------------------
+# Modern targets
+# -------------------------------------------------------------------------
 if(OpenFOAM_FOUND)
 
+  # Real INTERFACE target (no '::'), then ALIAS it to the namespaced name.
   if(NOT TARGET OpenFOAM_compileOptions)
     add_library(OpenFOAM_compileOptions INTERFACE)
     add_library(OpenFOAM::compileOptions ALIAS OpenFOAM_compileOptions)
@@ -157,6 +222,7 @@ if(OpenFOAM_FOUND)
     target_compile_features(OpenFOAM_compileOptions INTERFACE cxx_std_17)
   endif()
 
+  # Imported OpenFOAM core library
   if(NOT TARGET OpenFOAM::OpenFOAM)
     add_library(OpenFOAM::OpenFOAM UNKNOWN IMPORTED)
     set_target_properties(OpenFOAM::OpenFOAM PROPERTIES
@@ -169,11 +235,22 @@ if(OpenFOAM_FOUND)
         ${CMAKE_DL_LIBS}
     )
 
+    # libm is typically required on Linux; harmless if not needed elsewhere
     if(UNIX AND NOT APPLE)
       target_link_libraries(OpenFOAM::OpenFOAM INTERFACE m)
     endif()
   endif()
 
+  # Imported Pstream (optional, but fixes UPstream/gMax/gSum link errors)
+  if(OpenFOAM_Pstream_LIBRARY AND NOT TARGET OpenFOAM::Pstream)
+    add_library(OpenFOAM::Pstream UNKNOWN IMPORTED)
+    set_target_properties(OpenFOAM::Pstream PROPERTIES
+      IMPORTED_LOCATION "${OpenFOAM_Pstream_LIBRARY}"
+    )
+    target_link_libraries(OpenFOAM::Pstream INTERFACE OpenFOAM::OpenFOAM)
+  endif()
+
+  # meshTools depends on OpenFOAM
   if(NOT TARGET OpenFOAM::meshTools)
     add_library(OpenFOAM::meshTools UNKNOWN IMPORTED)
     set_target_properties(OpenFOAM::meshTools PROPERTIES
@@ -182,12 +259,22 @@ if(OpenFOAM_FOUND)
     target_link_libraries(OpenFOAM::meshTools INTERFACE OpenFOAM::OpenFOAM)
   endif()
 
+  # finiteVolume depends on meshTools + OpenFOAM (+ Pstream when available)
   if(NOT TARGET OpenFOAM::finiteVolume)
     add_library(OpenFOAM::finiteVolume UNKNOWN IMPORTED)
     set_target_properties(OpenFOAM::finiteVolume PROPERTIES
       IMPORTED_LOCATION "${OpenFOAM_finiteVolume_LIBRARY}"
     )
-    target_link_libraries(OpenFOAM::finiteVolume INTERFACE OpenFOAM::meshTools OpenFOAM::OpenFOAM)
+    target_link_libraries(OpenFOAM::finiteVolume
+      INTERFACE
+        OpenFOAM::meshTools
+        OpenFOAM::OpenFOAM
+    )
+
+    if(TARGET OpenFOAM::Pstream)
+      target_link_libraries(OpenFOAM::finiteVolume INTERFACE OpenFOAM::Pstream)
+    endif()
   endif()
 
 endif()
+

@@ -21,9 +21,42 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/Modules")
 find_package(Torch REQUIRED)
 find_package(OpenFOAM REQUIRED)
 
-# Torch sometimes provides TORCH_CXX_FLAGS as a single string; convert to list
-if(DEFINED TORCH_CXX_FLAGS AND NOT "${TORCH_CXX_FLAGS}" STREQUAL "")
-  separate_arguments(TORCH_CXX_FLAGS_LIST NATIVE_COMMAND "${TORCH_CXX_FLAGS}")
+# ---- Torch compatibility target (works whether Torch::Torch exists or not) ----
+if(NOT TARGET torch::torch_compat)
+  add_library(torch_torch_compat INTERFACE)
+  add_library(torch::torch_compat ALIAS torch_torch_compat)
+
+  # Prefer imported target if available; otherwise fall back to variables
+  if(TARGET Torch::Torch)
+    target_link_libraries(torch_torch_compat INTERFACE Torch::Torch)
+  else()
+    if(DEFINED TORCH_INCLUDE_DIRS)
+      target_include_directories(torch_torch_compat INTERFACE ${TORCH_INCLUDE_DIRS})
+    endif()
+    if(DEFINED TORCH_LIBRARIES)
+      target_link_libraries(torch_torch_compat INTERFACE ${TORCH_LIBRARIES})
+    else()
+      message(FATAL_ERROR "Torch was found, but TORCH_LIBRARIES is not set and Torch::Torch target is missing.")
+    endif()
+  endif()
+
+  # Torch sometimes provides TORCH_CXX_FLAGS as a single string; convert/apply
+  if(DEFINED TORCH_CXX_FLAGS AND NOT "${TORCH_CXX_FLAGS}" STREQUAL "")
+    separate_arguments(_TORCH_CXX_FLAGS_LIST NATIVE_COMMAND "${TORCH_CXX_FLAGS}")
+    target_compile_options(torch_torch_compat INTERFACE ${_TORCH_CXX_FLAGS_LIST})
+  endif()
+
+  target_compile_features(torch_torch_compat INTERFACE cxx_std_17)
+endif()
+
+# ---- Help runtime find libtorch.so on Linux/macOS (optional but helpful) ----
+# Infer <libtorch>/lib from Torch_DIR if possible.
+if(DEFINED Torch_DIR)
+  get_filename_component(_TORCH_PREFIX "${Torch_DIR}/../../.." ABSOLUTE)
+  if(EXISTS "${_TORCH_PREFIX}/lib")
+    set(CMAKE_BUILD_RPATH "${_TORCH_PREFIX}/lib")
+    set(CMAKE_INSTALL_RPATH "${_TORCH_PREFIX}/lib")
+  endif()
 endif()
 
 # ---- Subdirs ----
@@ -35,3 +68,4 @@ if(BUILD_TESTING)
   enable_testing()
   add_subdirectory(tests)
 endif()
+
