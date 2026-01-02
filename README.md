@@ -53,23 +53,46 @@ Replace the placeholders with paths on your system:
 - `Torch_DIR` must point to: `<LIBTORCH_ROOT>/share/cmake/Torch`
 - `CUDAToolkit_ROOT` / `CUDA_TOOLKIT_ROOT_DIR` must point to your CUDA Toolkit root
 
+This project supports a build-time precision switch via `PINN_TORCH_FP32`:
+
+- `PINN_TORCH_FP32=1` → FP32 (float)
+- `PINN_TORCH_FP32=0` → FP64 (double)
+
+#### FP32 configure
+
 ```bash
-cmake -S . -B build \
+cmake -S . -B build-fp32 \
   -DCMAKE_CXX_COMPILER=g++ \
   -DTorch_DIR=<LIBTORCH_ROOT>/share/cmake/Torch \
   -DCUDAToolkit_ROOT=<CUDA_TOOLKIT_ROOT> \
   -DCUDA_TOOLKIT_ROOT_DIR=<CUDA_TOOLKIT_ROOT> \
-  -DCMAKE_BUILD_TYPE=Release
+  -DCMAKE_BUILD_TYPE=Release \
+  -DPINN_TORCH_FP32=1
+```
+
+#### FP64 configure
+
+```bash
+cmake -S . -B build-fp64 \
+  -DCMAKE_CXX_COMPILER=g++ \
+  -DTorch_DIR=<LIBTORCH_ROOT>/share/cmake/Torch \
+  -DCUDAToolkit_ROOT=<CUDA_TOOLKIT_ROOT> \
+  -DCUDA_TOOLKIT_ROOT_DIR=<CUDA_TOOLKIT_ROOT> \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DPINN_TORCH_FP32=0
 ```
 
 ### 3) Build
 
 ```bash
-cmake --build build -j
+cmake --build build-fp32 -j   # for FP32 build
+cmake --build build-fp64 -j   # for FP64 build
 ```
 
 ### 4) Run all tests (pass/fail)
 
 ```bash
-ctest --test-dir build --output-on-failure
+ctest --test-dir build-fp32 --output-on-failure   # FP32
+ctest --test-dir build-fp64 --output-on-failure   # FP64
 ```
+
