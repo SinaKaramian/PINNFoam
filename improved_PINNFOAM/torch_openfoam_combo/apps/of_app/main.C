@@ -1,10 +1,15 @@
+// ============================================================
+// ONE-PLACE SWITCH: FP32 vs FP64
+//   1 => FP32 (float)
+//   0 => FP64 (double)
+// ============================================================
+#define PINN_TORCH_FP32 1
+
 #include <torch/torch.h>
 
 // STL
 #include <algorithm>
 #include <cmath>
-#include <fstream>
-#include <limits>
 #include <string>
 
 // OpenFOAM
@@ -13,49 +18,33 @@
 using namespace Foam;
 using namespace torch::indexing;
 
-static inline double clampMin(double v, double mn) { return v < mn ? mn : v; }
+// Map the macro to a Torch dtype + C++ scalar type
+#if PINN_TORCH_FP32
+    using torch_real = float;
+    static constexpr auto TORCH_DTYPE = torch::kFloat;
+#else
+    using torch_real = double;
+    static constexpr auto TORCH_DTYPE = torch::kDouble;
+#endif
 
-// ------------------------------------------------------------------ //
-// Expose protected fvMatrix<scalar> boundary-completion methods
-class fvScalarMatrixDebug : public fvScalarMatrix
+// Minimal wrapper to expose protected boundary-completion methods
+struct fvScalarMatrixExposed : public fvScalarMatrix
 {
-public:
-    explicit fvScalarMatrixDebug(const fvScalarMatrix& m)
-    :
-        fvScalarMatrix(m)
-    {}
-
-    void applyBoundaryDiagInPlace()
-    {
-        // scalar => component 0
-        this->addBoundaryDiag(this->diag(), 0);
-    }
-
-    void applyBoundarySourceInPlace(const bool couples = true)
-    {
-        this->addBoundarySource(this->source(), couples);
-    }
+    using fvScalarMatrix::fvScalarMatrix;
+    using fvScalarMatrix::addBoundaryDiag;
+    using fvScalarMatrix::addBoundarySource;
 };
 
 int main(int argc, char *argv[])
 {
     #include "setRootCase.H"
     #include "createTime.H"
-
     runTime.setTime(1.0, 1);
-
     #include "createMesh.H"
 
     volScalarField vf
     (
-        IOobject
-        (
-            "T",
-            runTime.timeName(),
-            mesh,
-            IOobject::MUST_READ,
-            IOobject::NO_WRITE
-        ),
+        IOobject("T", runTime.timeName(), mesh, IOobject::MUST_READ, IOobject::NO_WRITE),
         mesh
     );
 
@@ -67,133 +56,85 @@ int main(int argc, char *argv[])
 
     volScalarField error_c
     (
-        IOobject
-        (
-            "error_c",
-            runTime.timeName(),
-            mesh,
-            IOobject::NO_READ,
-            IOobject::AUTO_WRITE
-        ),
+        IOobject("error_c", runTime.timeName(), mesh, IOobject::NO_READ, IOobject::AUTO_WRITE),
         mesh,
         dimensionedScalar("zero", vf.dimensions(), 0.0)
     );
 
-    // ------------------------------------------------------------------ //
-    // Hyperparameters
-
+    // ---------------- Hyperparameters ----------------
     DynamicList<label> hiddenLayers;
     scalar optimizerStep;
-    label maxIterations;
+    label  maxIterations;
 
     scalar lambdaData;
+    scalar lambdaDisPINN;
 
-    // New DisPINN loss hyperparameter (with backward-compatible fallbacks)
-    scalar lambdaDisPINN = 0.0;
-
-    label warmupEpochs;        // warmup: only data loss
-    label dispinnRampEpochs;   // ramp: DisPINN weight increases to full
+    label  warmupEpochs;
+    label  dispinnRampEpochs;
 
     scalar trainFraction;
-    scalar dispinnFraction;    // which cells contribute to DisPINN MSE (after residual is formed)
-    label seed;
+    scalar dispinnFraction;
+    label  seed;
 
     const fvSolution& fvSolutionDict(mesh);
     const dictionary& aiDict = fvSolutionDict.subDict("AI");
 
-    hiddenLayers  = aiDict.get<DynamicList<label>>("hiddenLayers");
-    optimizerStep = aiDict.get<scalar>("optimizerStep");
-    maxIterations = aiDict.get<label>("maxIterations");
+    hiddenLayers      = aiDict.get<DynamicList<label>>("hiddenLayers");
+    optimizerStep     = aiDict.get<scalar>("optimizerStep");
+    maxIterations     = aiDict.get<label>("maxIterations");
 
-    lambdaData    = aiDict.get<scalar>("lambdaData");
+    lambdaData        = aiDict.get<scalar>("lambdaData");
+    lambdaDisPINN     = aiDict.found("lambdaDisPINN") ? aiDict.get<scalar>("lambdaDisPINN") : 0.0;
 
-    // --- DisPINN weight: prefer lambdaDisPINN, else (optional) reuse lambdaPDE ---
-    if (aiDict.found("lambdaDisPINN"))      lambdaDisPINN = aiDict.get<scalar>("lambdaDisPINN");
-    else if (aiDict.found("lambdaPDE"))     lambdaDisPINN = aiDict.get<scalar>("lambdaPDE");   // backward compat
+    warmupEpochs      = aiDict.found("warmupEpochs") ? aiDict.get<label>("warmupEpochs") : 0;
+    dispinnRampEpochs = aiDict.found("dispinnRampEpochs") ? aiDict.get<label>("dispinnRampEpochs") : 0;
 
-    // --- Warmup/Ramp: prefer dispinnRampEpochs, else reuse pdeRampEpochs ---
-    warmupEpochs = (aiDict.found("warmupEpochs") ? aiDict.get<label>("warmupEpochs") : 0);
+    trainFraction     = aiDict.get<scalar>("trainFraction");
+    dispinnFraction   = aiDict.found("dispinnFraction") ? aiDict.get<scalar>("dispinnFraction") : 1.0;
 
-    if (aiDict.found("dispinnRampEpochs"))      dispinnRampEpochs = aiDict.get<label>("dispinnRampEpochs");
-    else if (aiDict.found("pdeRampEpochs"))     dispinnRampEpochs = aiDict.get<label>("pdeRampEpochs"); // compat
-    else                                        dispinnRampEpochs = 0;
+    seed              = aiDict.get<label>("seed");
 
-    trainFraction = aiDict.get<scalar>("trainFraction");
-
-    // DisPINN sampling: prefer dispinnFraction, else reuse pdeFraction, else default 1
-    if (aiDict.found("dispinnFraction"))        dispinnFraction = aiDict.get<scalar>("dispinnFraction");
-    else if (aiDict.found("pdeFraction"))       dispinnFraction = aiDict.get<scalar>("pdeFraction");     // compat
-    else                                        dispinnFraction = 1.0;
-
-    seed          = aiDict.get<label>("seed");
-
-    trainFraction   = min(max(trainFraction,   scalar(0)), scalar(1));
-    dispinnFraction = min(max(dispinnFraction, scalar(0)), scalar(1));
-    warmupEpochs    = max(warmupEpochs,  label(0));
+    trainFraction     = min(max(trainFraction, scalar(0)), scalar(1));
+    dispinnFraction   = min(max(dispinnFraction, scalar(0)), scalar(1));
+    warmupEpochs      = max(warmupEpochs, label(0));
     dispinnRampEpochs = max(dispinnRampEpochs, label(0));
 
-    if (optimizerStep <= VSMALL)
-    {
-        WarningInFunction
-            << "optimizerStep is <= 0 (=" << optimizerStep
-            << "). Overriding to 1e-3." << nl << endl;
-        optimizerStep = 1e-3;
-    }
+    if (optimizerStep <= VSMALL) optimizerStep = 1e-3;
 
     // Old libtorch API in your build expects TypeMeta
-    torch::set_default_dtype(torch::scalarTypeToTypeMeta(torch::kDouble));
+    torch::set_default_dtype(torch::scalarTypeToTypeMeta(TORCH_DTYPE));
 
     // ---------------- GPU/CPU device selection ----------------
     torch::Device device(torch::kCPU);
     if (torch::cuda::is_available())
     {
         device = torch::Device(torch::kCUDA, 0);
-
-        Info<< "Torch CUDA found. device_count="
-            << static_cast<int>(torch::cuda::device_count())
-            << " -> using cuda:0" << nl << endl;
+        Info<< "Torch CUDA found -> using cuda:0" << nl << endl;
     }
     else
     {
         Info<< "Torch CUDA NOT found -> using CPU" << nl << endl;
     }
 
-    Info<< "Training setup:" << nl
-        << "  timeDir          = " << runTime.timeName() << nl
-        << "  nCells           = " << mesh.nCells() << nl
-        << "  hiddenLayers     = " << hiddenLayers << nl
-        << "  optimizerStep    = " << optimizerStep << nl
-        << "  trainFraction    = " << trainFraction << nl
-        << "  dispinnFraction  = " << dispinnFraction << nl
-        << "  seed             = " << seed << nl
-        << "  maxIterations    = " << maxIterations << nl
-        << "  lambdaData       = " << lambdaData << nl
-        << "  lambdaDisPINN    = " << lambdaDisPINN << nl
-        << "  warmupEpochs     = " << warmupEpochs << nl
-        << "  dispinnRampEpochs= " << dispinnRampEpochs << nl << endl;
-
-    // ------------------------------------------------------------------ //
-    // Build internal training tensors (2D: x,y)
-
+    // ---------------- Build tensors from mesh ----------------
     const label N = mesh.nCells();
-
     const scalarField& T_if = vf.internalField();
     const vectorField& C_if = mesh.C().internalField();
 
     // Create on CPU first (accessor writes require CPU), then move to selected device
-    auto cpu_opts = torch::TensorOptions().dtype(torch::kDouble).device(torch::kCPU);
+    auto cpu_opts = torch::TensorOptions().dtype(TORCH_DTYPE).device(torch::kCPU);
 
     torch::Tensor T_cpu  = torch::empty({N, 1}, cpu_opts);
     torch::Tensor XY_cpu = torch::empty({N, 2}, cpu_opts);
 
     {
-        auto Ta = T_cpu.accessor<double,2>();
-        auto Xa = XY_cpu.accessor<double,2>();
+        auto Ta = T_cpu.accessor<torch_real,2>();
+        auto Xa = XY_cpu.accessor<torch_real,2>();
         forAll(T_if, i)
         {
-            Ta[i][0] = static_cast<double>(T_if[i]);
-            Xa[i][0] = static_cast<double>(C_if[i].x());
-            Xa[i][1] = static_cast<double>(C_if[i].y());
+            Ta[i][0] = static_cast<torch_real>(T_if[i]);
+            Xa[i][0] = static_cast<torch_real>(C_if[i].x());
+            Xa[i][1] = static_cast<torch_real>(C_if[i].y());
         }
     }
 
@@ -204,20 +145,16 @@ int main(int argc, char *argv[])
     // Compute scaling for inputs: x' = 2*(x-xmin)/(xmax-xmin) - 1
     torch::Tensor xy_min = std::get<0>(XY_tensor.min(0, /*keepdim=*/true));
     torch::Tensor xy_max = std::get<0>(XY_tensor.max(0, /*keepdim=*/true));
-    torch::Tensor denom  = (xy_max - xy_min).clamp_min(1e-12);
-    torch::Tensor XY_scaled = 2.0*(XY_tensor - xy_min)/denom - 1.0;
+    torch::Tensor denom  = (xy_max - xy_min).clamp_min(static_cast<torch_real>(1e-12));
+    torch::Tensor XY_scaled =
+        static_cast<torch_real>(2.0) * (XY_tensor - xy_min) / denom - static_cast<torch_real>(1.0);
 
     // Output scaling statistics (for numerical conditioning)
     torch::Tensor T_mean = T_tensor.mean();
-    torch::Tensor T_std  = T_tensor.std().clamp_min(1e-12);
+    torch::Tensor T_std  = T_tensor.std().clamp_min(static_cast<torch_real>(1e-12));
 
-    // Train network to output scaled value; compute losses in physical units.
-    torch::Tensor T_scaled_target = (T_tensor - T_mean)/T_std;
-
-    // ------------------------------------------------------------------ //
-    // Subsampling (data + DisPINN residual cells)
-
-    const label nTrain = std::max<label>(1, label(std::round(trainFraction * N)));
+    // ---------------- Subsampling ----------------
+    const label nTrain = std::max<label>(1, label(std::round(trainFraction   * N)));
     const label nDis   = std::max<label>(1, label(std::round(dispinnFraction * N)));
 
     torch::manual_seed(seed);
@@ -227,31 +164,21 @@ int main(int argc, char *argv[])
         torch::TensorOptions().dtype(torch::kLong).device(device)
     );
 
-    torch::Tensor idxTrain = perm.narrow(/*dim=*/0, /*start=*/0,      /*length=*/nTrain);
-    torch::Tensor idxDis   = perm.narrow(/*dim=*/0, /*start=*/N-nDis, /*length=*/nDis);
+    torch::Tensor idxTrain = perm.narrow(0, 0,      nTrain);
+    torch::Tensor idxDis   = perm.narrow(0, N-nDis, nDis);
 
     torch::Tensor XY_data = XY_scaled.index_select(0, idxTrain).clone();
     torch::Tensor T_data  = T_tensor .index_select(0, idxTrain).clone();
-    XY_data.set_requires_grad(false);
 
-    Info<< "Subsampling:" << nl
-        << "  trainFraction   = " << trainFraction   << "  (nTrain=" << nTrain << ")" << nl
-        << "  dispinnFraction = " << dispinnFraction << "  (nDis="   << nDis   << ")" << nl
-        << "  seed            = " << seed << nl << endl;
-
-    // ------------------------------------------------------------------ //
-    // Assemble discrete operator A and RHS b for DisPINN:  r = A*x - b
+    // ---------------- Assemble DisPINN operator: A and b ----------------
     //
-    // Per your request:
-    //   1) build fvScalarMatrix
-    //   2) apply addBoundaryDiag/addBoundarySource (via debug wrapper)
-    //   3) use the same LDU structure as Amul (but implemented in Torch so gradients flow)
+    // Use your real equation here if needed. This is a placeholder operator.
+    // IMPORTANT: do NOT use (fvm::laplacian(vf_nn) == 0) because RHS int causes operator== mismatch.
+    fvScalarMatrixExposed Aeqn( fvm::laplacian(vf_nn) );
 
-    fvScalarMatrix A_tmp(fvm::laplacian(vf_nn)); // adjust operator here if needed
-    fvScalarMatrixDebug Aeqn(A_tmp);
-
-    Aeqn.applyBoundaryDiagInPlace();
-    Aeqn.applyBoundarySourceInPlace(true);
+    // Apply boundary completion
+    Aeqn.addBoundaryDiag(Aeqn.diag(), 0);
+    Aeqn.addBoundarySource(Aeqn.source(), true);
 
     const scalarField& Ad = Aeqn.diag();
     const scalarField& Au = Aeqn.upper();
@@ -264,10 +191,6 @@ int main(int argc, char *argv[])
 
     const label nIntFaces = upperAddr.size();
 
-    Info<< "DisPINN operator (LDU):" << nl
-        << "  N cells        = " << N << nl
-        << "  internal faces = " << nIntFaces << nl << endl;
-
     // Pack A and b into Torch tensors (constant during training)
     torch::Tensor A_diag_cpu  = torch::empty({N}, cpu_opts);
     torch::Tensor A_upper_cpu = torch::empty({nIntFaces}, cpu_opts);
@@ -279,23 +202,23 @@ int main(int argc, char *argv[])
     torch::Tensor upperAddr_cpu = torch::empty({nIntFaces}, idx_opts_cpu);
 
     {
-        auto dacc = A_diag_cpu.accessor<double,1>();
-        auto bacc = b_cpu.accessor<double,1>();
+        auto dacc = A_diag_cpu.accessor<torch_real,1>();
+        auto bacc = b_cpu.accessor<torch_real,1>();
         forAll(Ad, i)
         {
-            dacc[i] = static_cast<double>(Ad[i]);
-            bacc[i] = static_cast<double>(bF[i]);
+            dacc[i] = static_cast<torch_real>(Ad[i]);
+            bacc[i] = static_cast<torch_real>(bF[i]);
         }
 
-        auto uacc = A_upper_cpu.accessor<double,1>();
-        auto lacc = A_lower_cpu.accessor<double,1>();
+        auto uacc  = A_upper_cpu.accessor<torch_real,1>();
+        auto lacc  = A_lower_cpu.accessor<torch_real,1>();
         auto loacc = lowerAddr_cpu.accessor<long,1>();
         auto upacc = upperAddr_cpu.accessor<long,1>();
 
         for (label f = 0; f < nIntFaces; ++f)
         {
-            uacc[f]  = static_cast<double>(Au[f]);
-            lacc[f]  = static_cast<double>(Al[f]);
+            uacc[f]  = static_cast<torch_real>(Au[f]);
+            lacc[f]  = static_cast<torch_real>(Al[f]);
             loacc[f] = static_cast<long>(lowerAddr[f]);
             upacc[f] = static_cast<long>(upperAddr[f]);
         }
@@ -310,11 +233,11 @@ int main(int argc, char *argv[])
     torch::Tensor lowerAddr_t = lowerAddr_cpu.to(device);
     torch::Tensor upperAddr_t = upperAddr_cpu.to(device);
 
-    // Torch equivalent of OpenFOAM lduMatrix::Amul for internal field (differentiable w.r.t x)
+    // Differentiable Torch version of internal-face Amul (LDU)
     auto lduAmulTorch = [&](const torch::Tensor& xIn) -> torch::Tensor
     {
-        torch::Tensor x = xIn.view({-1});                 // (N)
-        torch::Tensor y = A_diag * x;                     // diag contribution
+        torch::Tensor x = xIn.view({-1});     // (N)
+        torch::Tensor y = A_diag * x;         // diag
 
         // y[lower] += upper[f] * x[upper]
         torch::Tensor xU = x.index_select(0, upperAddr_t);
@@ -327,24 +250,19 @@ int main(int argc, char *argv[])
         return y; // (N)
     };
 
-    // ------------------------------------------------------------------ //
-    // Build MLP (input 2 -> output 1 (scaled))
-
+    // ---------------- Build NN ----------------
     torch::nn::Sequential nn;
-
     nn->push_back(torch::nn::Linear(2, hiddenLayers[0]));
     nn->push_back(torch::nn::Tanh());
-
     for (label L = 1; L < hiddenLayers.size(); ++L)
     {
         nn->push_back(torch::nn::Linear(hiddenLayers[L-1], hiddenLayers[L]));
         nn->push_back(torch::nn::Tanh());
     }
-
     nn->push_back(torch::nn::Linear(hiddenLayers.back(), 1));
 
     nn->to(device);
-    nn->to(torch::kDouble);
+    nn->to(TORCH_DTYPE);
 
     torch::optim::Adam optimizer(
         nn->parameters(),
@@ -353,51 +271,40 @@ int main(int argc, char *argv[])
 
     const int PRINT_EVERY = 2000;
 
-    // ------------------------------------------------------------------ //
-    // Training loop (Data + DisPINN)
-
+    // ---------------- Training loop ----------------
     for (label epoch = 1; epoch <= maxIterations; ++epoch)
     {
         optimizer.zero_grad();
 
-        // ---- Data loss ----
+        // Data loss
         torch::Tensor T_pred_data_scaled = nn->forward(XY_data);
         torch::Tensor T_pred_data = T_pred_data_scaled*T_std + T_mean;
         torch::Tensor mse_data = torch::mse_loss(T_pred_data, T_data);
 
-        // ---- DisPINN ramp weight ----
-        double lambdaDis_eff = lambdaDisPINN;
-
-        if (epoch <= warmupEpochs)
-        {
-            lambdaDis_eff = 0.0;
-        }
+        // DisPINN ramp
+        double wDis = lambdaDisPINN;
+        if (epoch <= warmupEpochs) wDis = 0.0;
         else if (dispinnRampEpochs > 0 && epoch <= warmupEpochs + dispinnRampEpochs)
         {
             const double t = double(epoch - warmupEpochs)/double(dispinnRampEpochs);
-            lambdaDis_eff = lambdaDisPINN * t;
+            wDis = lambdaDisPINN * t;
         }
 
-        // ---- DisPINN loss:  || A*T_nn - b ||^2  (sampled over idxDis) ----
+        // DisPINN loss: ||A*T_nn - b||^2 (sample over idxDis)
         torch::Tensor mse_dispinn = torch::zeros({}, mse_data.options());
-
-        if (lambdaDis_eff > 0.0)
+        if (wDis > 0.0)
         {
-            // Need full-field NN prediction because A*x couples neighbors
-            torch::Tensor T_all_scaled = nn->forward(XY_scaled);
-            torch::Tensor T_all = T_all_scaled*T_std + T_mean;          // (N,1)
-            torch::Tensor x = T_all.view({-1});                         // (N)
+            torch::Tensor T_all_scaled = nn->forward(XY_scaled);      // (N,1)
+            torch::Tensor T_all = T_all_scaled*T_std + T_mean;        // (N,1)
+            torch::Tensor x = T_all.view({-1});                       // (N)
 
-            torch::Tensor Ax = lduAmulTorch(x);                         // (N)
-            torch::Tensor r  = Ax - b_vec;                              // (N)
-
+            torch::Tensor r = lduAmulTorch(x) - b_vec;                // (N)
             torch::Tensor r_sub = r.index_select(0, idxDis);
+
             mse_dispinn = torch::mse_loss(r_sub, torch::zeros_like(r_sub));
         }
 
-        // ---- Total loss (DisPINN added to data loss with a ramp) ----
-        torch::Tensor loss = lambdaData*mse_data + lambdaDis_eff*mse_dispinn;
-
+        torch::Tensor loss = lambdaData*mse_data + wDis*mse_dispinn;
         loss.backward();
         optimizer.step();
 
@@ -413,41 +320,31 @@ int main(int argc, char *argv[])
             }
 
             Info<< "Epoch = " << epoch << nl
-                << "Data MSE     = " << mse_data.item<double>() << nl
-                << "DisPINN MSE  = " << mse_dispinn.item<double>() << nl
-                << "lambdaDis_eff= " << lambdaDis_eff << nl
-                << "Training MSE = " << loss.item<double>() << nl
-                << "GradNorm     = " << Foam::sqrt(gradNorm2) << nl
+                << "Data MSE    = " << mse_data.item<double>() << nl
+                << "DisPINN MSE = " << mse_dispinn.item<double>() << nl
+                << "wDis        = " << wDis << nl
+                << "Loss        = " << loss.item<double>() << nl
+                << "GradNorm    = " << Foam::sqrt(gradNorm2) << nl
                 << endl;
         }
     }
 
-    // ------------------------------------------------------------------ //
-    // Write vf_nn and error fields
-
+    // ---------------- Write vf_nn and errors ----------------
     torch::NoGradGuard noGrad;
 
     torch::Tensor T_all_scaled = nn->forward(XY_scaled);
     torch::Tensor T_all = T_all_scaled*T_std + T_mean;
-    torch::Tensor T_flat = T_all.view({-1});
+    torch::Tensor T_flat_cpu = T_all.view({-1}).to(torch::kCPU).contiguous();
 
-    torch::Tensor T_flat_cpu = T_flat.to(torch::kCPU).contiguous();
-    auto Tacc = T_flat_cpu.accessor<double,1>();
-
-    forAll(vf_nn, cellI)
-    {
-        vf_nn[cellI] = Tacc[cellI];
-    }
+    auto Tacc = T_flat_cpu.accessor<torch_real,1>();
+    forAll(vf_nn, cellI) vf_nn[cellI] = static_cast<scalar>(Tacc[cellI]); // OpenFOAM scalar likely double
     vf_nn.correctBoundaryConditions();
 
     error_c = Foam::mag(vf - vf_nn);
 
     const scalarField diff = mag(vf.internalField() - vf_nn.internalField());
-    scalar errInf  = gMax(diff);
-    scalar errMean = gAverage(diff);
-
-    Info<< "max(|internal field - internal field_nn|)  = " << errInf  << nl
-        << "mean(|internal field - internal field_nn|) = " << errMean << nl << endl;
+    Info<< "max(|T - T_nn|)  = " << gMax(diff) << nl
+        << "mean(|T - T_nn|) = " << gAverage(diff) << nl << endl;
 
     volVectorField vf_grad ("vf_grad", fvc::grad(vf));
     volVectorField vf_nn_grad ("vf_nn_grad", fvc::grad(vf_nn));

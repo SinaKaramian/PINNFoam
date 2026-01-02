@@ -33,8 +33,7 @@ AI
     optimizerStep  1e-04;
 
     lambdaData     1.0;
-    lambdaPDE      0.0;
-    lambdaBC       1.0;
+    lambdaDisPINN      1.0;
 
     warmupEpochs   5000;
     pdeRampEpochs  5000;
