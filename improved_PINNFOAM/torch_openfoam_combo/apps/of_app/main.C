@@ -15,6 +15,28 @@ using namespace torch::indexing;
 
 static inline double clampMin(double v, double mn) { return v < mn ? mn : v; }
 
+// ------------------------------------------------------------------ //
+// Expose protected fvMatrix<scalar> boundary-completion methods
+class fvScalarMatrixDebug : public fvScalarMatrix
+{
+public:
+    explicit fvScalarMatrixDebug(const fvScalarMatrix& m)
+    :
+        fvScalarMatrix(m)
+    {}
+
+    void applyBoundaryDiagInPlace()
+    {
+        // scalar => component 0
+        this->addBoundaryDiag(this->diag(), 0);
+    }
+
+    void applyBoundarySourceInPlace(const bool couples = true)
+    {
+        this->addBoundarySource(this->source(), couples);
+    }
+};
+
 int main(int argc, char *argv[])
 {
     #include "setRootCase.H"
@@ -65,14 +87,15 @@ int main(int argc, char *argv[])
     label maxIterations;
 
     scalar lambdaData;
-    scalar lambdaPDE;
-    scalar lambdaBC;
 
-    label warmupEpochs;
-    label pdeRampEpochs;
+    // New DisPINN loss hyperparameter (with backward-compatible fallbacks)
+    scalar lambdaDisPINN = 0.0;
+
+    label warmupEpochs;        // warmup: only data loss
+    label dispinnRampEpochs;   // ramp: DisPINN weight increases to full
 
     scalar trainFraction;
-    scalar pdeFraction;
+    scalar dispinnFraction;    // which cells contribute to DisPINN MSE (after residual is formed)
     label seed;
 
     const fvSolution& fvSolutionDict(mesh);
@@ -83,20 +106,31 @@ int main(int argc, char *argv[])
     maxIterations = aiDict.get<label>("maxIterations");
 
     lambdaData    = aiDict.get<scalar>("lambdaData");
-    lambdaPDE     = aiDict.get<scalar>("lambdaPDE");
-    lambdaBC      = aiDict.get<scalar>("lambdaBC");
 
-    warmupEpochs  = aiDict.get<label>("warmupEpochs");
-    pdeRampEpochs = aiDict.get<label>("pdeRampEpochs");
+    // --- DisPINN weight: prefer lambdaDisPINN, else (optional) reuse lambdaPDE ---
+    if (aiDict.found("lambdaDisPINN"))      lambdaDisPINN = aiDict.get<scalar>("lambdaDisPINN");
+    else if (aiDict.found("lambdaPDE"))     lambdaDisPINN = aiDict.get<scalar>("lambdaPDE");   // backward compat
+
+    // --- Warmup/Ramp: prefer dispinnRampEpochs, else reuse pdeRampEpochs ---
+    warmupEpochs = (aiDict.found("warmupEpochs") ? aiDict.get<label>("warmupEpochs") : 0);
+
+    if (aiDict.found("dispinnRampEpochs"))      dispinnRampEpochs = aiDict.get<label>("dispinnRampEpochs");
+    else if (aiDict.found("pdeRampEpochs"))     dispinnRampEpochs = aiDict.get<label>("pdeRampEpochs"); // compat
+    else                                        dispinnRampEpochs = 0;
 
     trainFraction = aiDict.get<scalar>("trainFraction");
-    pdeFraction   = aiDict.get<scalar>("pdeFraction");
+
+    // DisPINN sampling: prefer dispinnFraction, else reuse pdeFraction, else default 1
+    if (aiDict.found("dispinnFraction"))        dispinnFraction = aiDict.get<scalar>("dispinnFraction");
+    else if (aiDict.found("pdeFraction"))       dispinnFraction = aiDict.get<scalar>("pdeFraction");     // compat
+    else                                        dispinnFraction = 1.0;
+
     seed          = aiDict.get<label>("seed");
 
-    trainFraction = min(max(trainFraction, scalar(0)), scalar(1));
-    pdeFraction   = min(max(pdeFraction,   scalar(0)), scalar(1));
-    warmupEpochs  = max(warmupEpochs,  label(0));
-    pdeRampEpochs = max(pdeRampEpochs, label(0));
+    trainFraction   = min(max(trainFraction,   scalar(0)), scalar(1));
+    dispinnFraction = min(max(dispinnFraction, scalar(0)), scalar(1));
+    warmupEpochs    = max(warmupEpochs,  label(0));
+    dispinnRampEpochs = max(dispinnRampEpochs, label(0));
 
     if (optimizerStep <= VSMALL)
     {
@@ -115,7 +149,6 @@ int main(int argc, char *argv[])
     {
         device = torch::Device(torch::kCUDA, 0);
 
-        // IMPORTANT FIX: device_count() may be int8_t (signed char) -> cast to int for OpenFOAM Info<<
         Info<< "Torch CUDA found. device_count="
             << static_cast<int>(torch::cuda::device_count())
             << " -> using cuda:0" << nl << endl;
@@ -126,19 +159,18 @@ int main(int argc, char *argv[])
     }
 
     Info<< "Training setup:" << nl
-        << "  timeDir        = " << runTime.timeName() << nl
-        << "  nCells         = " << mesh.nCells() << nl
-        << "  hiddenLayers   = " << hiddenLayers << nl
-        << "  optimizerStep  = " << optimizerStep << nl
-        << "  trainFraction  = " << trainFraction << nl
-        << "  pdeFraction    = " << pdeFraction << nl
-        << "  seed           = " << seed << nl
-        << "  maxIterations  = " << maxIterations << nl
-        << "  lambdaData     = " << lambdaData << nl
-        << "  lambdaPDE      = " << lambdaPDE << nl
-        << "  lambdaBC       = " << lambdaBC << nl
-        << "  warmupEpochs   = " << warmupEpochs << nl
-        << "  pdeRampEpochs  = " << pdeRampEpochs << nl << endl;
+        << "  timeDir          = " << runTime.timeName() << nl
+        << "  nCells           = " << mesh.nCells() << nl
+        << "  hiddenLayers     = " << hiddenLayers << nl
+        << "  optimizerStep    = " << optimizerStep << nl
+        << "  trainFraction    = " << trainFraction << nl
+        << "  dispinnFraction  = " << dispinnFraction << nl
+        << "  seed             = " << seed << nl
+        << "  maxIterations    = " << maxIterations << nl
+        << "  lambdaData       = " << lambdaData << nl
+        << "  lambdaDisPINN    = " << lambdaDisPINN << nl
+        << "  warmupEpochs     = " << warmupEpochs << nl
+        << "  dispinnRampEpochs= " << dispinnRampEpochs << nl << endl;
 
     // ------------------------------------------------------------------ //
     // Build internal training tensors (2D: x,y)
@@ -175,11 +207,6 @@ int main(int argc, char *argv[])
     torch::Tensor denom  = (xy_max - xy_min).clamp_min(1e-12);
     torch::Tensor XY_scaled = 2.0*(XY_tensor - xy_min)/denom - 1.0;
 
-    // Physical derivative scaling factors: d/dx = sx * d/dx', with sx=2/(xmax-xmin)
-    torch::Tensor s = 2.0/denom; // shape (1,2)
-    const double sx = s.index({0,0}).item<double>();
-    const double sy = s.index({0,1}).item<double>();
-
     // Output scaling statistics (for numerical conditioning)
     torch::Tensor T_mean = T_tensor.mean();
     torch::Tensor T_std  = T_tensor.std().clamp_min(1e-12);
@@ -188,13 +215,10 @@ int main(int argc, char *argv[])
     torch::Tensor T_scaled_target = (T_tensor - T_mean)/T_std;
 
     // ------------------------------------------------------------------ //
-    // Subsampling
-
-    trainFraction = std::min(1.0, std::max(0.0, trainFraction));
-    pdeFraction   = std::min(1.0, std::max(0.0, pdeFraction));
+    // Subsampling (data + DisPINN residual cells)
 
     const label nTrain = std::max<label>(1, label(std::round(trainFraction * N)));
-    const label nPDE   = std::max<label>(1, label(std::round(pdeFraction   * N)));
+    const label nDis   = std::max<label>(1, label(std::round(dispinnFraction * N)));
 
     torch::manual_seed(seed);
 
@@ -204,114 +228,104 @@ int main(int argc, char *argv[])
     );
 
     torch::Tensor idxTrain = perm.narrow(/*dim=*/0, /*start=*/0,      /*length=*/nTrain);
-    torch::Tensor idxPDE   = perm.narrow(/*dim=*/0, /*start=*/N-nPDE, /*length=*/nPDE);
+    torch::Tensor idxDis   = perm.narrow(/*dim=*/0, /*start=*/N-nDis, /*length=*/nDis);
 
     torch::Tensor XY_data = XY_scaled.index_select(0, idxTrain).clone();
     torch::Tensor T_data  = T_tensor .index_select(0, idxTrain).clone();
     XY_data.set_requires_grad(false);
 
-    torch::Tensor XY_pde  = XY_scaled.index_select(0, idxPDE).clone();
-    XY_pde.set_requires_grad(true);
-
     Info<< "Subsampling:" << nl
-        << "  trainFraction = " << trainFraction << "  (nTrain=" << nTrain << ")" << nl
-        << "  pdeFraction   = " << pdeFraction   << "  (nPDE="   << nPDE   << ")" << nl
-        << "  seed          = " << seed << nl << endl;
+        << "  trainFraction   = " << trainFraction   << "  (nTrain=" << nTrain << ")" << nl
+        << "  dispinnFraction = " << dispinnFraction << "  (nDis="   << nDis   << ")" << nl
+        << "  seed            = " << seed << nl << endl;
 
     // ------------------------------------------------------------------ //
-    // Boundary tensors
+    // Assemble discrete operator A and RHS b for DisPINN:  r = A*x - b
+    //
+    // Per your request:
+    //   1) build fvScalarMatrix
+    //   2) apply addBoundaryDiag/addBoundarySource (via debug wrapper)
+    //   3) use the same LDU structure as Amul (but implemented in Torch so gradients flow)
 
-    auto makePatchXY = [&](const fvPatch& pp) -> torch::Tensor
+    fvScalarMatrix A_tmp(fvm::laplacian(vf_nn)); // adjust operator here if needed
+    fvScalarMatrixDebug Aeqn(A_tmp);
+
+    Aeqn.applyBoundaryDiagInPlace();
+    Aeqn.applyBoundarySourceInPlace(true);
+
+    const scalarField& Ad = Aeqn.diag();
+    const scalarField& Au = Aeqn.upper();
+    const scalarField& Al = Aeqn.lower();
+    const scalarField& bF = Aeqn.source();
+
+    const lduAddressing& addr = Aeqn.lduAddr();
+    const labelUList& lowerAddr = addr.lowerAddr();
+    const labelUList& upperAddr = addr.upperAddr();
+
+    const label nIntFaces = upperAddr.size();
+
+    Info<< "DisPINN operator (LDU):" << nl
+        << "  N cells        = " << N << nl
+        << "  internal faces = " << nIntFaces << nl << endl;
+
+    // Pack A and b into Torch tensors (constant during training)
+    torch::Tensor A_diag_cpu  = torch::empty({N}, cpu_opts);
+    torch::Tensor A_upper_cpu = torch::empty({nIntFaces}, cpu_opts);
+    torch::Tensor A_lower_cpu = torch::empty({nIntFaces}, cpu_opts);
+    torch::Tensor b_cpu       = torch::empty({N}, cpu_opts);
+
+    auto idx_opts_cpu = torch::TensorOptions().dtype(torch::kLong).device(torch::kCPU);
+    torch::Tensor lowerAddr_cpu = torch::empty({nIntFaces}, idx_opts_cpu);
+    torch::Tensor upperAddr_cpu = torch::empty({nIntFaces}, idx_opts_cpu);
+
     {
-        const label nF = pp.size();
-
-        torch::Tensor XYp_cpu = torch::empty({nF, 2}, cpu_opts);
-        auto acc = XYp_cpu.accessor<double,2>();
-        const vectorField& Cf = pp.Cf();
-        for (label i = 0; i < nF; ++i)
+        auto dacc = A_diag_cpu.accessor<double,1>();
+        auto bacc = b_cpu.accessor<double,1>();
+        forAll(Ad, i)
         {
-            acc[i][0] = static_cast<double>(Cf[i].x());
-            acc[i][1] = static_cast<double>(Cf[i].y());
+            dacc[i] = static_cast<double>(Ad[i]);
+            bacc[i] = static_cast<double>(bF[i]);
         }
 
-        torch::Tensor XYp = XYp_cpu.to(device);
-        return 2.0*(XYp - xy_min)/denom - 1.0;
-    };
+        auto uacc = A_upper_cpu.accessor<double,1>();
+        auto lacc = A_lower_cpu.accessor<double,1>();
+        auto loacc = lowerAddr_cpu.accessor<long,1>();
+        auto upacc = upperAddr_cpu.accessor<long,1>();
 
-    auto makePatchN = [&](const fvPatch& pp) -> torch::Tensor
-    {
-        const label nF = pp.size();
-
-        torch::Tensor Np_cpu = torch::empty({nF, 2}, cpu_opts);
-        auto acc = Np_cpu.accessor<double,2>();
-        tmp<vectorField> tnf = pp.nf();
-        const vectorField& nf = tnf();
-        for (label i = 0; i < nF; ++i)
+        for (label f = 0; f < nIntFaces; ++f)
         {
-            acc[i][0] = static_cast<double>(nf[i].x());
-            acc[i][1] = static_cast<double>(nf[i].y());
+            uacc[f]  = static_cast<double>(Au[f]);
+            lacc[f]  = static_cast<double>(Al[f]);
+            loacc[f] = static_cast<long>(lowerAddr[f]);
+            upacc[f] = static_cast<long>(upperAddr[f]);
         }
-        return Np_cpu.to(device);
+    }
+
+    // Move constants to compute device
+    torch::Tensor A_diag  = A_diag_cpu.to(device);
+    torch::Tensor A_upper = A_upper_cpu.to(device);
+    torch::Tensor A_lower = A_lower_cpu.to(device);
+    torch::Tensor b_vec   = b_cpu.to(device);
+
+    torch::Tensor lowerAddr_t = lowerAddr_cpu.to(device);
+    torch::Tensor upperAddr_t = upperAddr_cpu.to(device);
+
+    // Torch equivalent of OpenFOAM lduMatrix::Amul for internal field (differentiable w.r.t x)
+    auto lduAmulTorch = [&](const torch::Tensor& xIn) -> torch::Tensor
+    {
+        torch::Tensor x = xIn.view({-1});                 // (N)
+        torch::Tensor y = A_diag * x;                     // diag contribution
+
+        // y[lower] += upper[f] * x[upper]
+        torch::Tensor xU = x.index_select(0, upperAddr_t);
+        y.index_add_(0, lowerAddr_t, A_upper * xU);
+
+        // y[upper] += lower[f] * x[lower]
+        torch::Tensor xL = x.index_select(0, lowerAddr_t);
+        y.index_add_(0, upperAddr_t, A_lower * xL);
+
+        return y; // (N)
     };
-
-    const polyBoundaryMesh& pbm = mesh.boundaryMesh();
-
-    auto patchId = [&](const word& name) -> label
-    {
-        forAll(pbm, i)
-        {
-            if (pbm[i].name() == name) return i;
-        }
-        return -1;
-    };
-
-    const label idWest  = patchId("west");
-    const label idEast  = patchId("east");
-    const label idSouth = patchId("south");
-    const label idNorth = patchId("north");
-
-    torch::Tensor XY_w, N_w, XY_e, N_e, XY_s, N_s, XY_n;
-    bool hasW=false, hasE=false, hasS=false, hasN=false;
-
-    if (idWest >= 0)
-    {
-        const fvPatch& pp = mesh.boundary()[idWest];
-        XY_w = makePatchXY(pp); XY_w.set_requires_grad(true);
-        N_w  = makePatchN(pp);
-        hasW = true;
-    }
-    if (idEast >= 0)
-    {
-        const fvPatch& pp = mesh.boundary()[idEast];
-        XY_e = makePatchXY(pp); XY_e.set_requires_grad(true);
-        N_e  = makePatchN(pp);
-        hasE = true;
-    }
-    if (idSouth >= 0)
-    {
-        const fvPatch& pp = mesh.boundary()[idSouth];
-        XY_s = makePatchXY(pp); XY_s.set_requires_grad(true);
-        N_s  = makePatchN(pp);
-        hasS = true;
-    }
-    if (idNorth >= 0)
-    {
-        const fvPatch& pp = mesh.boundary()[idNorth];
-        XY_n = makePatchXY(pp); XY_n.set_requires_grad(true);
-        hasN = true;
-    }
-
-    if (!hasW || !hasE || !hasS || !hasN)
-    {
-        WarningInFunction
-            << "One or more expected patches not found. "
-            << "Found: west=" << hasW << ", east=" << hasE
-            << ", south=" << hasS << ", north=" << hasN << nl << endl;
-    }
-
-    const double T_north = 100.0;
-    const double g_west  = 500.0;
-    const double g_zero  = 0.0;
 
     // ------------------------------------------------------------------ //
     // Build MLP (input 2 -> output 1 (scaled))
@@ -340,114 +354,49 @@ int main(int argc, char *argv[])
     const int PRINT_EVERY = 2000;
 
     // ------------------------------------------------------------------ //
-    // Training loop
+    // Training loop (Data + DisPINN)
 
     for (label epoch = 1; epoch <= maxIterations; ++epoch)
     {
         optimizer.zero_grad();
 
+        // ---- Data loss ----
         torch::Tensor T_pred_data_scaled = nn->forward(XY_data);
         torch::Tensor T_pred_data = T_pred_data_scaled*T_std + T_mean;
-
         torch::Tensor mse_data = torch::mse_loss(T_pred_data, T_data);
 
-        torch::Tensor mse_pde = torch::zeros({}, mse_data.options());
+        // ---- DisPINN ramp weight ----
+        double lambdaDis_eff = lambdaDisPINN;
 
-        double lambdaPDE_eff = lambdaPDE;
         if (epoch <= warmupEpochs)
         {
-            lambdaPDE_eff = 0.0;
+            lambdaDis_eff = 0.0;
         }
-        else if (pdeRampEpochs > 0 && epoch <= warmupEpochs + pdeRampEpochs)
+        else if (dispinnRampEpochs > 0 && epoch <= warmupEpochs + dispinnRampEpochs)
         {
-            const double t = double(epoch - warmupEpochs)/double(pdeRampEpochs);
-            lambdaPDE_eff = lambdaPDE * t;
+            const double t = double(epoch - warmupEpochs)/double(dispinnRampEpochs);
+            lambdaDis_eff = lambdaDisPINN * t;
         }
 
-        if (lambdaPDE_eff > 0.0)
+        // ---- DisPINN loss:  || A*T_nn - b ||^2  (sampled over idxDis) ----
+        torch::Tensor mse_dispinn = torch::zeros({}, mse_data.options());
+
+        if (lambdaDis_eff > 0.0)
         {
-            torch::Tensor T_pred_pde_scaled = nn->forward(XY_pde);
-            torch::Tensor T_pred_pde = T_pred_pde_scaled*T_std + T_mean;
+            // Need full-field NN prediction because A*x couples neighbors
+            torch::Tensor T_all_scaled = nn->forward(XY_scaled);
+            torch::Tensor T_all = T_all_scaled*T_std + T_mean;          // (N,1)
+            torch::Tensor x = T_all.view({-1});                         // (N)
 
-            auto grad1 = torch::autograd::grad(
-                {T_pred_pde},
-                {XY_pde},
-                {torch::ones_like(T_pred_pde)},
-                /*retain_graph=*/true,
-                /*create_graph=*/true
-            )[0];
+            torch::Tensor Ax = lduAmulTorch(x);                         // (N)
+            torch::Tensor r  = Ax - b_vec;                              // (N)
 
-            auto dTdxp = grad1.index({Slice(), 0}).view({-1,1});
-            auto dTdyp = grad1.index({Slice(), 1}).view({-1,1});
-
-            auto grad2x = torch::autograd::grad(
-                {dTdxp}, {XY_pde}, {torch::ones_like(dTdxp)}, /*retain=*/true, /*create=*/true
-            )[0].index({Slice(), 0}).view({-1,1});
-
-            auto grad2y = torch::autograd::grad(
-                {dTdyp}, {XY_pde}, {torch::ones_like(dTdyp)}, /*retain=*/true, /*create=*/true
-            )[0].index({Slice(), 1}).view({-1,1});
-
-            torch::Tensor lap = (sx*sx)*grad2x + (sy*sy)*grad2y;
-
-            mse_pde = torch::mse_loss(lap, torch::zeros_like(lap));
+            torch::Tensor r_sub = r.index_select(0, idxDis);
+            mse_dispinn = torch::mse_loss(r_sub, torch::zeros_like(r_sub));
         }
 
-        torch::Tensor mse_bc = torch::zeros({}, mse_data.options());
-
-        if (lambdaBC > 0.0)
-        {
-            torch::Tensor bcAccum = torch::zeros({}, mse_data.options());
-            int bcTerms = 0;
-
-            if (hasN)
-            {
-                torch::Tensor Tn_scaled = nn->forward(XY_n);
-                torch::Tensor Tn = Tn_scaled*T_std + T_mean;
-                bcAccum = bcAccum + torch::mse_loss(Tn, torch::full_like(Tn, T_north));
-                bcTerms++;
-            }
-
-            auto bcNeumann = [&](const torch::Tensor& XYp, const torch::Tensor& Np, double gTarget)
-            {
-                torch::Tensor Tp_scaled = nn->forward(XYp);
-                torch::Tensor Tp = Tp_scaled*T_std + T_mean;
-
-                auto g1 = torch::autograd::grad(
-                    {Tp}, {XYp}, {torch::ones_like(Tp)}, /*retain=*/true, /*create=*/true
-                )[0];
-
-                torch::Tensor dTdx = sx * g1.index({Slice(),0});
-                torch::Tensor dTdy = sy * g1.index({Slice(),1});
-
-                torch::Tensor flux =
-                    Np.index({Slice(),0})*dTdx +
-                    Np.index({Slice(),1})*dTdy;
-
-                torch::Tensor target = torch::full_like(flux, gTarget);
-                return torch::mse_loss(flux, target);
-            };
-
-            if (hasW)
-            {
-                bcAccum = bcAccum + bcNeumann(XY_w, N_w, g_west);
-                bcTerms++;
-            }
-            if (hasE)
-            {
-                bcAccum = bcAccum + bcNeumann(XY_e, N_e, g_zero);
-                bcTerms++;
-            }
-            if (hasS)
-            {
-                bcAccum = bcAccum + bcNeumann(XY_s, N_s, g_zero);
-                bcTerms++;
-            }
-
-            if (bcTerms > 0) mse_bc = bcAccum / double(bcTerms);
-        }
-
-        torch::Tensor loss = lambdaData*mse_data + lambdaPDE_eff*mse_pde + lambdaBC*mse_bc;
+        // ---- Total loss (DisPINN added to data loss with a ramp) ----
+        torch::Tensor loss = lambdaData*mse_data + lambdaDis_eff*mse_dispinn;
 
         loss.backward();
         optimizer.step();
@@ -464,12 +413,11 @@ int main(int argc, char *argv[])
             }
 
             Info<< "Epoch = " << epoch << nl
-                << "Data MSE = " << mse_data.item<double>() << nl
-                << "PDE  MSE = " << mse_pde.item<double>() << nl
-                << "BC   MSE = " << mse_bc.item<double>() << nl
-                << "lambdaPDE_eff = " << lambdaPDE_eff << nl
+                << "Data MSE     = " << mse_data.item<double>() << nl
+                << "DisPINN MSE  = " << mse_dispinn.item<double>() << nl
+                << "lambdaDis_eff= " << lambdaDis_eff << nl
                 << "Training MSE = " << loss.item<double>() << nl
-                << "GradNorm = " << Foam::sqrt(gradNorm2) << nl
+                << "GradNorm     = " << Foam::sqrt(gradNorm2) << nl
                 << endl;
         }
     }
@@ -498,7 +446,7 @@ int main(int argc, char *argv[])
     scalar errInf  = gMax(diff);
     scalar errMean = gAverage(diff);
 
-    Info<< "max(|internal field - internal field_nn|) = " << errInf << nl
+    Info<< "max(|internal field - internal field_nn|)  = " << errInf  << nl
         << "mean(|internal field - internal field_nn|) = " << errMean << nl << endl;
 
     volVectorField vf_grad ("vf_grad", fvc::grad(vf));
